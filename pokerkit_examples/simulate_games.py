@@ -22,11 +22,9 @@ _PROJECT_ROOT = os.path.dirname(_SCRIPT_DIR)
 if _PROJECT_ROOT not in sys.path:
     sys.path.insert(0, _PROJECT_ROOT)
 
-from agents.simple_agent import (
-    CallStationAgent,
-    EquityMonteCarloAgent,
-    RandomAgent,
-    TightAggressiveAgent,
+from agents.realistic_agents import (
+    NitAgent, TightAggressiveAgent, LooseAggressiveAgent,
+    LoosePassiveAgent, BalancedAgent, RandomAgent
 )
 from infinite_holdem import Card, InfiniteHoldemGame, card_to_index
 
@@ -111,27 +109,64 @@ def _normalize_action(
 def _make_agent(label: str, rng: random.Random):
     if label == "random":
         return RandomAgent()
-    if label == "call_station":
-        return CallStationAgent()
-    if label == "tag":
-        return TightAggressiveAgent(aggression=rng.uniform(0.45, 0.75))
-    if label == "equity":
-        return EquityMonteCarloAgent(simulations=40, aggression=rng.uniform(0.35, 0.65))
+    if label == "nit":
+        return NitAgent()
+    if label == "tight_aggressive":
+        return TightAggressiveAgent()
+    if label == "loose_aggressive":
+        return LooseAggressiveAgent()
+    if label == "loose_passive":
+        return LoosePassiveAgent()
+    if label == "balanced":
+        return BalancedAgent()
     raise ValueError(f"Unknown agent label: {label}")
 
 
 def _select_agents(agent_mix: str, hand_id: int):
     rng = random.Random(hand_id)
+
     if agent_mix == "random":
-        return RandomAgent(), RandomAgent()
-    if agent_mix == "tag":
-        return _make_agent("tag", rng), _make_agent("tag", rng)
-    if agent_mix == "equity":
-        return _make_agent("equity", rng), _make_agent("equity", rng)
+        return _make_agent("random", rng), _make_agent("random", rng)
+    if agent_mix == "nit":
+        return _make_agent("nit", rng), _make_agent("nit", rng)
+    if agent_mix == "tight_aggressive":
+        return _make_agent("tight_aggressive", rng), _make_agent("tight_aggressive", rng)
+    if agent_mix == "loose_aggressive":
+        return _make_agent("loose_aggressive", rng), _make_agent("loose_aggressive", rng)
+    if agent_mix == "loose_passive":
+        return _make_agent("loose_passive", rng), _make_agent("loose_passive", rng)
+    if agent_mix == "balanced":
+        return _make_agent("balanced", rng), _make_agent("balanced", rng)
     if agent_mix == "mixed":
-        labels = rng.sample(["random", "call_station", "tag", "equity"], 2)
+        labels = rng.sample(
+            [
+                "random",
+                "nit",
+                "tight_aggressive",
+                "loose_aggressive",
+                "loose_passive",
+                "balanced",
+            ],
+            2,
+        )
         return _make_agent(labels[0], rng), _make_agent(labels[1], rng)
+
     raise ValueError(f"Unsupported agent mix: {agent_mix}")
+
+
+
+# def _select_agents(agent_mix: str, hand_id: int):
+#     rng = random.Random(hand_id)
+#     if agent_mix == "random":
+#         return RandomAgent(), RandomAgent()
+#     if agent_mix == "tag":
+#         return _make_agent("tag", rng), _make_agent("tag", rng)
+#     if agent_mix == "equity":
+#         return _make_agent("equity", rng), _make_agent("equity", rng)
+#     if agent_mix == "mixed":
+#         labels = rng.sample(["random", "call_station", "tag", "equity"], 2)
+#         return _make_agent(labels[0], rng), _make_agent(labels[1], rng)
+#     raise ValueError(f"Unsupported agent mix: {agent_mix}")
 
 
 def simulate_hand(
@@ -211,7 +246,7 @@ def simulate_hand(
 
 
 def generate_dataset(
-    num_hands: int = 1000,
+    num_hands: int = 10000,
     output_file: str = "data/infinite_holdem_training_data.json",
     agent_mix: str = "mixed",
 ) -> List[Dict]:
@@ -284,7 +319,7 @@ def generate_dataset(
 
 if __name__ == "__main__":
     dataset = generate_dataset(
-        num_hands=200,
+        num_hands=100000,
         output_file="data/infinite_holdem_training_data.json",
         agent_mix="mixed",
     )
