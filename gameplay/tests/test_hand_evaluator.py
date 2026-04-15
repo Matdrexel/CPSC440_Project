@@ -1,25 +1,7 @@
-"""
-test_hand_evaluator.py — Unit tests for the custom hand evaluator.
-
-Folder structure:
-    project/
-    ├── env/
-    │   ├── card.py
-    │   ├── deck.py
-    │   └── hand_evaluator.py
-    └── tests/
-        └── test_hand_evaluator.py
-
-Run from the project root with:  python -m pytest tests/test_hand_evaluator.py -v
-"""
-
-import sys
-import os
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'env'))
-
 import pytest
-from card import card as make_card
-from hand_evaluator import check_hand, hand_name
+
+from gameplay.env.card import card as make_card
+from gameplay.env.hand_evaluator import check_hand, hand_name
 
 # ---------------------------------------------------------------------------
 # Helpers

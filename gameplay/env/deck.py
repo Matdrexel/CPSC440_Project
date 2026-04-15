@@ -1,5 +1,6 @@
 import random
-from card import rank, suit
+
+from .card import rank, suit
  
 # All 52 possible card values (0–51)
 ALL_CARDS = list(range(52))

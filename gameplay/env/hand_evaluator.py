@@ -19,7 +19,7 @@ Tuple comparison: higher first element wins; ties broken by subsequent elements.
 All tiebreaker masks use bit-positions equal to card rank (Ace = bit 14).
 """
 
-from card import rank, suit
+from .card import rank, suit
 
 
 # ---------------------------------------------------------------------------
