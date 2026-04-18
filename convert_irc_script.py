@@ -1,11 +1,23 @@
 #!/usr/bin/env python3
 """
-Convert fixed-limit IRC hold'em archives into the same per-decision JSON shape
-used by `pokerkit_examples/simulate_games.py`.
+Convert fixed-limit IRC hold'em archives into per-decision JSON examples for
+the shared training pipeline.
+
+Each emitted row keeps the action / reward labels and metadata, but replaces
+the verbose raw state fields with a compact state-vector object:
+
+- `hole_cards`                               — card indices, shape (2,)
+- `board_cards`                              — card indices or -1, shape (5,)
+- `street_one_hot`                           — [preflop, flop, turn, river], shape (4,)
+- `position`                                 — 0=BB (OOP), 1=BTN (IP)
+- `my_stack`                                 — raw stack
+- `opponent_stack`                           — raw stack
+- `pot`                                      — raw pot size
+- `my_bet_this_street`                       — raw bet this street
+- `opp_bet_this_street`                      — raw bet this street
 
 The converter is intentionally conservative:
-- it only processes heads-up hands by default, because the common schema is
-  heads-up (`stack`, `opponent_stack`, two-entry `current_bets`, etc.),
+- it only processes heads-up hands by default,
 - it only targets fixed-limit hold'em style archives where street bet sizing is
   recoverable from the action strings,
 - it only emits rows for players whose private cards are known in the IRC logs.
@@ -48,6 +60,12 @@ SUPPORTED_ARCHIVE_PREFIXES = (
 MAX_LIMIT_BETS_PER_ROUND = 4
 HAND_ID_ARCHIVE_MULTIPLIER = 10**12
 STANDARD_VARIANT_TAG = "standard_holdem_irc"
+STREET_TO_ONE_HOT_INDEX = {
+    "preflop": 0,
+    "flop": 1,
+    "turn": 2,
+    "river": 3,
+}
 
 
 @dataclass(frozen=True)
@@ -85,6 +103,50 @@ def cards_to_count_encoding(cards: Sequence[str]) -> List[int]:
         if card in CARD_TO_INDEX:
             counts[CARD_TO_INDEX[card]] += 1
     return counts
+
+
+def build_state_vector(
+    *,
+    street: str,
+    actor_pos: int,
+    hole_cards: Sequence[str],
+    board_cards: Sequence[str],
+    bankrolls: Dict[int, int],
+    total_contributed: Dict[int, int],
+    current_bets: Dict[int, int],
+    pot_size: int,
+) -> Dict[str, object]:
+    if len(hole_cards) != 2:
+        raise ValueError("State vectors require exactly two hole cards")
+    if street not in STREET_TO_ONE_HOT_INDEX:
+        raise ValueError(f"Unsupported street: {street}")
+
+    opponent_pos = 2 if actor_pos == 1 else 1
+    street_one_hot = [0, 0, 0, 0]
+    street_one_hot[STREET_TO_ONE_HOT_INDEX[street]] = 1
+
+    indexed_board = [CARD_TO_INDEX[card] for card in board_cards[:5]]
+    while len(indexed_board) < 5:
+        indexed_board.append(-1)
+
+    stack = bankrolls[actor_pos] - total_contributed[actor_pos]
+    opponent_stack = bankrolls[opponent_pos] - total_contributed[opponent_pos]
+    position = 1 if actor_pos == 1 else 0
+
+    return {
+        "hole_cards": [
+            CARD_TO_INDEX[hole_cards[0]],
+            CARD_TO_INDEX[hole_cards[1]],
+        ],
+        "board_cards": indexed_board,
+        "street_one_hot": street_one_hot,
+        "position": position,
+        "my_stack": stack,
+        "opponent_stack": opponent_stack,
+        "pot": pot_size,
+        "my_bet_this_street": current_bets[actor_pos],
+        "opp_bet_this_street": current_bets[opponent_pos],
+    }
 
 
 def parse_summary(value: str) -> Tuple[int, int]:
@@ -262,29 +324,19 @@ def make_example(
     if len(actor_record.hole_cards) != 2:
         return None
 
-    opponent_pos = 2 if actor_pos == 1 else 1
-    position_to_index = {1: 0, 2: 1}
-
-    stack = bankrolls[actor_pos] - total_contributed[actor_pos]
-    opponent_stack = bankrolls[opponent_pos] - total_contributed[opponent_pos]
-    current_high_bet = max(current_bets.values())
-    to_call = current_high_bet - current_bets[actor_pos]
+    state_vector = build_state_vector(
+        street=street,
+        actor_pos=actor_pos,
+        hole_cards=actor_record.hole_cards,
+        board_cards=board_cards,
+        bankrolls=bankrolls,
+        total_contributed=total_contributed,
+        current_bets=current_bets,
+        pot_size=pot_size,
+    )
 
     return {
-        "hole_cards": list(actor_record.hole_cards),
-        "board_cards": list(board_cards),
-        "hole_card_counts": cards_to_count_encoding(actor_record.hole_cards),
-        "board_card_counts": cards_to_count_encoding(board_cards),
-        "pot_size": pot_size,
-        "stack": stack,
-        "opponent_stack": opponent_stack,
-        "position": position_to_index[actor_pos],
-        "street": street,
-        "to_call": to_call,
-        "current_bets": [current_bets[1], current_bets[2]],
-        "legal_actions": list(legal_actions),
-        "min_raise_to": min_raise_to,
-        "max_raise_to": max_raise_to,
+        "state_vector": state_vector,
         "action": action,
         "raise_amount": raise_amount,
         "reward": actor_record.reward,
@@ -556,7 +608,9 @@ def append_json_examples(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Convert fixed-limit IRC hold'em archives to the common JSON training schema.")
+    parser = argparse.ArgumentParser(
+        description="Convert fixed-limit IRC hold'em archives to compact vectorized JSON training examples."
+    )
     parser.add_argument(
         "--input",
         default="CPSC440_Project/IRCdata",
