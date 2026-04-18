@@ -63,3 +63,4 @@ htmlcov/
 # Keep data folder but ignore contents
 data/*
 !data/.gitkeep
+IRCdata/
