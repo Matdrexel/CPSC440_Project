@@ -48,6 +48,10 @@ DATASET_PROFILES = {
         "colors": ["#e76f51", "#f4a261", "#e9c46a", "#d62828"],
     },
 }
+MIXED_DATASET_PROFILE = {
+    "title": "Mixed Hold'em Dataset",
+    "colors": ["#6d597a", "#b56576", "#e56b6f", "#eaac8b"],
+}
 
 
 try:
@@ -116,12 +120,24 @@ def _sanitize_slug(value: str) -> str:
 
 def _detect_dataset_profile(filepath: str, data: List[Dict[str, Any]]) -> Dict[str, Any]:
     variant_counts = Counter(example.get("variant_tag", "unknown") for example in data)
-    variant_tag = variant_counts.most_common(1)[0][0] if variant_counts else "unknown"
+    variant_tags = list(variant_counts.keys())
+    stem = os.path.splitext(os.path.basename(filepath))[0]
 
-    if variant_tag in DATASET_PROFILES:
+    if len(variant_tags) > 1:
+        profile = {
+            "slug": _sanitize_slug(stem),
+            "title": MIXED_DATASET_PROFILE["title"],
+            "colors": list(MIXED_DATASET_PROFILE["colors"]),
+        }
+        variant_tag = "mixed"
+    else:
+        variant_tag = variant_counts.most_common(1)[0][0] if variant_counts else "unknown"
+
+    if len(variant_tags) > 1:
+        pass
+    elif variant_tag in DATASET_PROFILES:
         profile = dict(DATASET_PROFILES[variant_tag])
     else:
-        stem = os.path.splitext(os.path.basename(filepath))[0]
         profile = {
             "slug": _sanitize_slug(variant_tag if variant_tag != "unknown" else stem),
             "title": stem.replace("_", " ").title(),
@@ -129,7 +145,8 @@ def _detect_dataset_profile(filepath: str, data: List[Dict[str, Any]]) -> Dict[s
         }
 
     profile["variant_tag"] = variant_tag
-    profile["source_stem"] = os.path.splitext(os.path.basename(filepath))[0]
+    profile["variant_counts"] = dict(variant_counts)
+    profile["source_stem"] = stem
     profile["graphs_dir"] = os.path.join(GRAPHS_DIR, profile["slug"])
     return profile
 
@@ -809,6 +826,10 @@ def main(filepath: str):
 
     os.makedirs(graphs_dir, exist_ok=True)
     print(f"Detected dataset: {dataset_profile['title']} ({dataset_profile['variant_tag']})")
+    if dataset_profile["variant_tag"] == "mixed":
+        print("Mixed sources:")
+        for variant_tag, count in sorted(dataset_profile["variant_counts"].items()):
+            print(f"  {variant_tag}: {count}")
 
     print_summary_stats(data)
     analyze_agent_tendencies(data)
