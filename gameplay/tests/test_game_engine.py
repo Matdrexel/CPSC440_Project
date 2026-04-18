@@ -10,8 +10,8 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '..'
 
 import numpy as np
 import pytest
-from game_engine import GameEngine, GameState, Action, Street
-from state_encoder import StateEncoder
+from env.game_engine import GameEngine, GameState, Action, Street
+from env.state_encoder import StateEncoder
 
 
 # ---------------------------------------------------------------------------
@@ -340,13 +340,13 @@ class TestChipConservation:
 
 class TestStateEncoder:
     def setup_method(self):
-        self.encoder = StateEncoder()
+        self.encoder = StateEncoder(mc_samples=10)   # fast for tests
         self.engine = make_engine()
         self.state = self.engine.reset()
 
     def test_obs_shape(self):
         obs = self.encoder.encode(self.state, player_id=0)
-        assert obs.shape == (17,)
+        assert obs.shape == (18,)  # 17 base features + 1 MC equity
 
     def test_obs_dtype(self):
         obs = self.encoder.encode(self.state, player_id=0)
@@ -413,15 +413,73 @@ class TestStateEncoder:
         assert obs0[11] != obs1[11]
 
     def test_encode_both_matches_individual(self):
+        # MC equity is stochastic so we compare only the deterministic features [0:17]
         obs0, obs1 = self.encoder.encode_both(self.state)
-        assert np.array_equal(obs0, self.encoder.encode(self.state, 0))
-        assert np.array_equal(obs1, self.encoder.encode(self.state, 1))
+        assert np.array_equal(obs0[:17], self.encoder.encode(self.state, 0)[:17])
+        assert np.array_equal(obs1[:17], self.encoder.encode(self.state, 1)[:17])
 
     def test_feature_names_length(self):
         assert len(self.encoder.feature_names()) == self.encoder.obs_size
 
     def test_obs_size_attribute(self):
-        assert self.encoder.obs_size == 17
+        assert self.encoder.obs_size == 18
+
+
+# ---------------------------------------------------------------------------
+# MC Equity
+# ---------------------------------------------------------------------------
+
+class TestMCEquity:
+    """Tests that mc_equity() produces sensible values using the custom
+    infinite deck and hand evaluator."""
+
+    def test_equity_in_range(self):
+        from state_encoder import mc_equity
+        from card import card as make_card
+        hole = [make_card(14, 3), make_card(14, 2)]   # AA
+        eq = mc_equity(hole, board=[], n_samples=200)
+        assert 0.0 <= eq <= 1.0
+
+    def test_strong_hand_high_equity(self):
+        # AA preflop should win well above 50% vs random
+        from state_encoder import mc_equity
+        from card import card as make_card
+        hole = [make_card(14, 3), make_card(14, 2)]
+        eq = mc_equity(hole, board=[], n_samples=500)
+        assert eq > 0.60, f"AA equity {eq:.3f} unexpectedly low"
+
+    def test_weak_hand_lower_equity(self):
+        # 72o is the weakest starting hand
+        from state_encoder import mc_equity
+        from card import card as make_card
+        hole = [make_card(7, 0), make_card(2, 1)]
+        eq = mc_equity(hole, board=[], n_samples=500)
+        assert eq < 0.45, f"72o equity {eq:.3f} unexpectedly high"
+
+    def test_equity_with_board(self):
+        from state_encoder import mc_equity
+        from card import card as make_card
+        # Hero has a made flush five (5x A♠) — should be near 1.0
+        hole  = [make_card(14, 3), make_card(14, 3)]
+        board = [make_card(14, 3), make_card(14, 3), make_card(14, 3)]
+        eq = mc_equity(hole, board, n_samples=200)
+        assert eq > 0.90, f"Flush-five equity {eq:.3f} unexpectedly low"
+
+    def test_equity_feature_in_obs(self):
+        engine  = make_engine()
+        encoder = StateEncoder(mc_samples=50)
+        state   = engine.reset()
+        obs     = encoder.encode(state, player_id=0)
+        equity  = obs[17]   # last feature
+        assert 0.0 <= equity <= 1.0
+
+    def test_equity_differs_by_hand_strength(self):
+        # Two different hole card pairs should generally produce different equity
+        from state_encoder import mc_equity
+        from card import card as make_card
+        eq_aa = mc_equity([make_card(14,3), make_card(14,2)], [], n_samples=300)
+        eq_72 = mc_equity([make_card(7, 0), make_card(2, 1)], [], n_samples=300)
+        assert eq_aa > eq_72
 
 
 if __name__ == "__main__":

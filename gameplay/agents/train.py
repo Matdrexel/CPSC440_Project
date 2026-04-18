@@ -105,19 +105,39 @@ def train(args):
         raise_sizes    = args.raise_sizes,
     )
 
+    # --- BC reference policy (optional) ----------------------------------
+    bc_policy = None
+    if args.bc_reference is not None:
+        from bc_trainer import BCPolicy
+        bc_policy = BCPolicy(
+            checkpoint_path = args.bc_reference,
+            obs_size        = env.obs_size,
+            n_actions       = env.n_actions,
+            hidden_size     = args.hidden_size,
+            device          = device,
+        )
+
     agent = PPOAgent(
-        obs_size      = env.obs_size,
-        n_actions     = env.n_actions,
-        hidden_size   = args.hidden_size,
-        lr            = args.lr,
-        clip_eps      = args.clip_eps,
-        c_value       = args.c_value,
-        c_entropy     = args.c_entropy,
-        n_epochs      = args.n_epochs,
-        batch_size    = args.batch_size,
-        max_grad_norm = args.max_grad_norm,
-        device        = device,
+        obs_size           = env.obs_size,
+        n_actions          = env.n_actions,
+        hidden_size        = args.hidden_size,
+        lr                 = args.lr,
+        clip_eps           = args.clip_eps,
+        c_value            = args.c_value,
+        c_entropy          = args.c_entropy,
+        n_epochs           = args.n_epochs,
+        batch_size         = args.batch_size,
+        max_grad_norm      = args.max_grad_norm,
+        device             = device,
+        bc_policy          = bc_policy,
+        bc_kl_coeff        = args.bc_kl_coeff,
+        bc_kl_decay_steps  = args.bc_kl_decay_steps,
     )
+
+    # Load BC pretrained weights if provided
+    if args.bc_checkpoint is not None:
+        agent.load(args.bc_checkpoint)
+        print(f"Loaded BC pretrained weights from {args.bc_checkpoint}")
 
     buffer = RolloutBuffer(
         obs_size   = env.obs_size,
@@ -129,57 +149,61 @@ def train(args):
 
     os.makedirs(args.save_dir, exist_ok=True)
 
-    # Rolling windows for smoothed logging
-    reward_window = deque(maxlen=100)   # mean BB/hand over last 100 updates
+    reward_window = deque(maxlen=100)
     loss_window   = deque(maxlen=20)
 
     total_steps  = 0
     update_count = 0
     start_time   = time.time()
 
+    bc_status = ""
+    if args.bc_checkpoint:
+        bc_status = f"  bc_checkpoint={args.bc_checkpoint}, kl_coeff={args.bc_kl_coeff}, decay_steps={args.bc_kl_decay_steps}"
+
     print(f"\nStarting self-play PPO training")
     print(f"  obs_size={env.obs_size}  n_actions={env.n_actions}")
     print(f"  steps_per_update={args.steps_per_update}  total_steps={args.total_steps}")
-    print(f"  lr={args.lr}  clip_eps={args.clip_eps}  n_epochs={args.n_epochs}\n")
+    print(f"  lr={args.lr}  clip_eps={args.clip_eps}  n_epochs={args.n_epochs}")
+    if bc_status:
+        print(bc_status)
+    print()
 
     # --- Main loop -------------------------------------------------------
     while total_steps < args.total_steps:
-        # 1. Collect rollout
         rollout_stats = collect_rollout(env, agent, buffer, args.steps_per_update)
         total_steps  += rollout_stats["steps_collected"]
         update_count += 1
 
         reward_window.append(rollout_stats["mean_reward_bb"])
-
-        # 2. PPO update
         update_metrics = agent.update(buffer)
         loss_window.append(update_metrics["total_loss"])
 
-        # 3. Logging
         if update_count % args.log_every == 0:
-            elapsed = time.time() - start_time
+            elapsed       = time.time() - start_time
             steps_per_sec = total_steps / elapsed
             smooth_reward = np.mean(reward_window)
             smooth_loss   = np.mean(loss_window)
+            beta          = update_metrics.get("bc_beta", 0.0)
+            bc_kl         = update_metrics.get("bc_kl_loss", 0.0)
 
+            bc_str = f" | bc_beta: {beta:.3f} | bc_kl: {bc_kl:.4f}" if bc_policy else ""
             print(
                 f"[update {update_count:5d} | steps {total_steps:8d}] "
                 f"reward/hand: {smooth_reward:+.3f} BB | "
                 f"loss: {smooth_loss:.4f} | "
-                f"policy_loss: {update_metrics['policy_loss']:.4f} | "
-                f"value_loss: {update_metrics['value_loss']:.4f} | "
+                f"policy: {update_metrics['policy_loss']:.4f} | "
+                f"value: {update_metrics['value_loss']:.4f} | "
                 f"entropy: {update_metrics['entropy']:.4f} | "
-                f"kl: {update_metrics['approx_kl']:.4f} | "
+                f"kl: {update_metrics['approx_kl']:.4f}"
+                f"{bc_str} | "
                 f"{steps_per_sec:.0f} steps/s"
             )
 
-        # 4. Checkpoint
         if update_count % args.save_every == 0:
             path = os.path.join(args.save_dir, f"checkpoint_{update_count:05d}.pt")
             agent.save(path)
             print(f"  → saved checkpoint: {path}")
 
-    # Final save
     final_path = os.path.join(args.save_dir, "final.pt")
     agent.save(final_path)
     print(f"\nTraining complete. Final model saved to {final_path}")
@@ -209,13 +233,24 @@ def parse_args():
     p.add_argument("--lr",            type=float, default=3e-4)
     p.add_argument("--clip_eps",      type=float, default=0.2)
     p.add_argument("--c_value",       type=float, default=0.5)
-    p.add_argument("--c_entropy",     type=float, default=0.01)
+    p.add_argument("--c_entropy",     type=float, default=0.05)
     p.add_argument("--n_epochs",      type=int,   default=4)
     p.add_argument("--batch_size",    type=int,   default=64)
     p.add_argument("--max_grad_norm", type=float, default=0.5)
 
     # Network
-    p.add_argument("--hidden_size", type=int, default=128)
+    p.add_argument("--hidden_size", type=int, default=256)
+
+    # BC regularisation
+    p.add_argument("--bc_checkpoint",     type=str,   default=None,
+                   help="Path to bc_pretrained.pt from bc_trainer.py (warm-starts PPO weights)")
+    p.add_argument("--bc_reference",      type=str,   default=None,
+                   help="Path to bc_reference.pt — frozen policy used for KL penalty. "
+                        "Defaults to bc_checkpoint if not set separately.")
+    p.add_argument("--bc_kl_coeff",       type=float, default=1.0,
+                   help="Initial KL penalty coefficient beta_0")
+    p.add_argument("--bc_kl_decay_steps", type=int,   default=500_000,
+                   help="Steps over which KL penalty decays linearly to zero")
 
     # Misc
     p.add_argument("--save_dir",   type=str, default="checkpoints")
@@ -230,4 +265,8 @@ def parse_args():
 
 
 if __name__ == "__main__":
-    train(parse_args())
+    args = parse_args()
+    # Default bc_reference to bc_checkpoint if not separately specified
+    if args.bc_checkpoint is not None and args.bc_reference is None:
+        args.bc_reference = args.bc_checkpoint
+    train(args)
