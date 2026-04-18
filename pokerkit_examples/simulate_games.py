@@ -33,23 +33,25 @@ VARIANT_TAG = "infinite_holdem_v1"
 
 
 @dataclass
-class TrainingExample:
-    """Canonical phase-1 training example for the infinite variant."""
+class StateVector:
+    """Serializable state payload that maps directly to the later model vector."""
 
-    hole_cards: List[str]
-    board_cards: List[str]
-    hole_card_counts: List[int]
-    board_card_counts: List[int]
-    pot_size: int
-    stack: int
-    opponent_stack: int
+    hole_cards: List[int]
+    board_cards: List[int]
+    street_one_hot: List[int]
     position: int
-    street: str
-    to_call: int
-    current_bets: List[int]
-    legal_actions: List[str]
-    min_raise_to: Optional[int]
-    max_raise_to: Optional[int]
+    my_stack: int
+    opponent_stack: int
+    pot: int
+    my_bet_this_street: int
+    opp_bet_this_street: int
+
+
+@dataclass
+class TrainingExample:
+    """Training example containing the exact requested JSON schema."""
+
+    state_vector: StateVector
     action: str
     raise_amount: Optional[int]
     reward: float
@@ -59,22 +61,52 @@ class TrainingExample:
     variant_tag: str
 
 
-def cards_to_count_encoding(cards: List[Card]) -> List[int]:
-    """Encode cards as 52-dimensional counts instead of one-hot flags."""
-
-    counts = [0] * 52
-    for card in cards:
-        counts[card_to_index(card)] += 1
-    return counts
-
-
-def _cards_to_strings(cards: List[Card]) -> List[str]:
-    return [str(card) for card in cards]
-
-
 def _has_duplicates(cards: List[Card]) -> bool:
-    card_strings = _cards_to_strings(cards)
+    card_strings = [str(card) for card in cards]
     return len(card_strings) != len(set(card_strings))
+
+
+def _encode_hole_cards(cards: List[Card]) -> List[int]:
+    return [card_to_index(card) for card in cards]
+
+
+def _encode_board_cards(cards: List[Card]) -> List[int]:
+    encoded = [card_to_index(card) for card in cards]
+    while len(encoded) < 5:
+        encoded.append(-1)
+    return encoded[:5]
+
+
+def _street_one_hot(street: str) -> List[int]:
+    mapping = {
+        "preflop": [1, 0, 0, 0],
+        "flop": [0, 1, 0, 0],
+        "turn": [0, 0, 1, 0],
+        "river": [0, 0, 0, 1],
+    }
+    if street not in mapping:
+        raise ValueError(f"Unsupported street for state serialization: {street}")
+    return mapping[street]
+
+
+def _serialize_position(player_idx: int) -> int:
+    """Map engine player index to requested semantic position."""
+
+    return 1 if player_idx == 0 else 0
+
+
+def _build_state_vector(game: InfiniteHoldemGame, actor: int) -> StateVector:
+    return StateVector(
+        hole_cards=_encode_hole_cards(game.hole_cards[actor]),
+        board_cards=_encode_board_cards(game.board),
+        street_one_hot=_street_one_hot(game.street),
+        position=_serialize_position(actor),
+        my_stack=game.stacks[actor],
+        opponent_stack=game.stacks[1 - actor],
+        pot=game.pot,
+        my_bet_this_street=game.current_bets[actor],
+        opp_bet_this_street=game.current_bets[1 - actor],
+    )
 
 
 def _normalize_action(
@@ -152,23 +184,6 @@ def _select_agents(agent_mix: str, hand_id: int):
         return _make_agent(labels[0], rng), _make_agent(labels[1], rng)
 
     raise ValueError(f"Unsupported agent mix: {agent_mix}")
-
-
-
-# def _select_agents(agent_mix: str, hand_id: int):
-#     rng = random.Random(hand_id)
-#     if agent_mix == "random":
-#         return RandomAgent(), RandomAgent()
-#     if agent_mix == "tag":
-#         return _make_agent("tag", rng), _make_agent("tag", rng)
-#     if agent_mix == "equity":
-#         return _make_agent("equity", rng), _make_agent("equity", rng)
-#     if agent_mix == "mixed":
-#         labels = rng.sample(["random", "call_station", "tag", "equity"], 2)
-#         return _make_agent(labels[0], rng), _make_agent(labels[1], rng)
-#     raise ValueError(f"Unsupported agent mix: {agent_mix}")
-
-
 def simulate_hand(
     agent0,
     agent1,
@@ -187,6 +202,7 @@ def simulate_hand(
     )
     agents = [agent0, agent1]
     examples: List[TrainingExample] = []
+    example_owners: List[int] = []
     step_in_hand = 0
 
     game.deal_hole_cards()
@@ -199,22 +215,8 @@ def simulate_hand(
             raise RuntimeError("Engine reached a non-terminal state with no current actor")
 
         actor = game.actor_index
-        legal_actions = game.get_legal_actions(actor)
         example = TrainingExample(
-            hole_cards=_cards_to_strings(game.hole_cards[actor]),
-            board_cards=_cards_to_strings(game.board),
-            hole_card_counts=cards_to_count_encoding(game.hole_cards[actor]),
-            board_card_counts=cards_to_count_encoding(game.board),
-            pot_size=game.pot,
-            stack=game.stacks[actor],
-            opponent_stack=game.stacks[1 - actor],
-            position=actor,
-            street=game.street,
-            to_call=game.get_to_call(actor),
-            current_bets=list(game.current_bets),
-            legal_actions=list(legal_actions),
-            min_raise_to=game.get_min_raise_to(actor),
-            max_raise_to=game.get_max_raise_to(actor),
+            state_vector=_build_state_vector(game, actor),
             action="",
             raise_amount=None,
             reward=0.0,
@@ -229,6 +231,7 @@ def simulate_hand(
         example.action = action
         example.raise_amount = raise_amount
         examples.append(example)
+        example_owners.append(actor)
 
         game.apply_action(actor, action, raise_amount)
         step_in_hand += 1
@@ -238,8 +241,8 @@ def simulate_hand(
 
     all_cards = game.hole_cards[0] + game.hole_cards[1] + game.board
     hand_has_duplicates = _has_duplicates(all_cards)
-    for example in examples:
-        example.reward = payoffs[example.position]
+    for example, owner in zip(examples, example_owners):
+        example.reward = payoffs[owner]
         example.has_duplicates = hand_has_duplicates
 
     return examples
@@ -281,7 +284,7 @@ def generate_dataset(
 
         payoffs_by_position = {}
         for example in hand_examples:
-            payoffs_by_position[example.position] = example.reward
+            payoffs_by_position[example.state_vector.position] = example.reward
         if len(payoffs_by_position) == 1:
             only_position, only_reward = next(iter(payoffs_by_position.items()))
             payoffs_by_position[1 - only_position] = -only_reward
@@ -329,13 +332,17 @@ if __name__ == "__main__":
     print("=" * 50)
 
     for index, example in enumerate(dataset[:3], start=1):
+        state = example["state_vector"]
         print(f"\nExample {index}:")
-        print(f"  Street: {example['street']}, Position: P{example['position']}")
-        print(f"  Hole cards: {example['hole_cards']}")
-        print(f"  Board cards: {example['board_cards']}")
-        print(f"  Pot: {example['pot_size']}, To call: {example['to_call']}")
-        print(f"  Legal actions: {example['legal_actions']}")
-        print(f"  Current bets: {example['current_bets']}")
+        print(f"  Hole cards: {state['hole_cards']}")
+        print(f"  Board cards: {state['board_cards']}")
+        print(f"  Street one-hot: {state['street_one_hot']}")
+        print(f"  Position: {state['position']}")
+        print(f"  My stack: {state['my_stack']}")
+        print(f"  Opponent stack: {state['opponent_stack']}")
+        print(f"  Pot: {state['pot']}")
+        print(f"  My bet this street: {state['my_bet_this_street']}")
+        print(f"  Opp bet this street: {state['opp_bet_this_street']}")
         print(f"  Action: {example['action']}", end="")
         if example["raise_amount"] is not None:
             print(f" to {example['raise_amount']}", end="")
