@@ -6,7 +6,7 @@ the shared training pipeline.
 Each emitted row keeps the action / reward labels and metadata, but replaces
 the verbose raw state fields with a compact state-vector object:
 
-- `hole_cards`                               — card indices, shape (2,)
+- `hole_cards`                               — card indices, or -1 if unrevealed, shape (2,)
 - `board_cards`                              — card indices or -1, shape (5,)
 - `street_one_hot`                           — [preflop, flop, turn, river], shape (4,)
 - `position`                                 — 0=BB (OOP), 1=BTN (IP)
@@ -20,7 +20,8 @@ The converter is intentionally conservative:
 - it only processes heads-up hands by default,
 - it only targets fixed-limit hold'em style archives where street bet sizing is
   recoverable from the action strings,
-- it only emits rows for players whose private cards are known in the IRC logs.
+- it encodes unrevealed private cards as `-1` so non-showdown actions can still
+  be preserved.
 
 Example:
     python3 convert_irc_script.py \
@@ -116,14 +117,16 @@ def build_state_vector(
     current_bets: Dict[int, int],
     pot_size: int,
 ) -> Dict[str, object]:
-    if len(hole_cards) != 2:
-        raise ValueError("State vectors require exactly two hole cards")
     if street not in STREET_TO_ONE_HOT_INDEX:
         raise ValueError(f"Unsupported street: {street}")
 
     opponent_pos = 2 if actor_pos == 1 else 1
     street_one_hot = [0, 0, 0, 0]
     street_one_hot[STREET_TO_ONE_HOT_INDEX[street]] = 1
+
+    indexed_hole_cards = [CARD_TO_INDEX[card] for card in hole_cards[:2] if card in CARD_TO_INDEX]
+    while len(indexed_hole_cards) < 2:
+        indexed_hole_cards.append(-1)
 
     indexed_board = [CARD_TO_INDEX[card] for card in board_cards[:5]]
     while len(indexed_board) < 5:
@@ -134,10 +137,7 @@ def build_state_vector(
     position = 1 if actor_pos == 1 else 0
 
     return {
-        "hole_cards": [
-            CARD_TO_INDEX[hole_cards[0]],
-            CARD_TO_INDEX[hole_cards[1]],
-        ],
+        "hole_cards": indexed_hole_cards,
         "board_cards": indexed_board,
         "street_one_hot": street_one_hot,
         "position": position,
@@ -321,8 +321,6 @@ def make_example(
     raise_amount: Optional[int],
 ) -> Optional[Dict]:
     actor_record = player_records[actor_pos]
-    if len(actor_record.hole_cards) != 2:
-        return None
 
     state_vector = build_state_vector(
         street=street,
