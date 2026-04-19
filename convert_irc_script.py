@@ -149,9 +149,15 @@ def build_state_vector(
     }
 
 
-def parse_summary(value: str) -> Tuple[int, int]:
+def parse_summary(value: str) -> Optional[Tuple[int, int]]:
+    if value.count("/") != 1:
+        return None
+
     players_left, pot_size = value.split("/", 1)
-    return int(players_left), int(pot_size)
+    try:
+        return int(players_left), int(pot_size)
+    except ValueError:
+        return None
 
 
 def parse_hdb_line(line: str) -> Optional[HdbRecord]:
@@ -159,22 +165,46 @@ def parse_hdb_line(line: str) -> Optional[HdbRecord]:
     if len(parts) < 8:
         return None
 
+    preflop_summary = parse_summary(parts[4])
+    flop_summary = parse_summary(parts[5])
+    turn_summary = parse_summary(parts[6])
+    final_summary = parse_summary(parts[7])
+    if None in (preflop_summary, flop_summary, turn_summary, final_summary):
+        return None
+
+    try:
+        timestamp = int(parts[0])
+        hand_number = int(parts[2])
+        num_players = int(parts[3])
+    except ValueError:
+        return None
+
     board_cards = parts[8:]
     return HdbRecord(
-        timestamp=int(parts[0]),
-        hand_number=int(parts[2]),
-        num_players=int(parts[3]),
+        timestamp=timestamp,
+        hand_number=hand_number,
+        num_players=num_players,
         board_cards=board_cards,
-        preflop_summary=parse_summary(parts[4]),
-        flop_summary=parse_summary(parts[5]),
-        turn_summary=parse_summary(parts[6]),
-        final_summary=parse_summary(parts[7]),
+        preflop_summary=preflop_summary,
+        flop_summary=flop_summary,
+        turn_summary=turn_summary,
+        final_summary=final_summary,
     )
 
 
 def parse_pdb_line(line: str) -> Optional[PlayerRecord]:
     parts = line.split()
     if len(parts) < 11:
+        return None
+
+    try:
+        timestamp = int(parts[1])
+        num_players = int(parts[2])
+        position = int(parts[3])
+        bankroll = int(parts[8])
+        paid = int(parts[9])
+        won = int(parts[10])
+    except ValueError:
         return None
 
     hole_cards: List[str] = []
@@ -185,13 +215,13 @@ def parse_pdb_line(line: str) -> Optional[PlayerRecord]:
 
     return PlayerRecord(
         name=parts[0],
-        timestamp=int(parts[1]),
-        num_players=int(parts[2]),
-        position=int(parts[3]),
+        timestamp=timestamp,
+        num_players=num_players,
+        position=position,
         actions=[parts[4], parts[5], parts[6], parts[7]],
-        bankroll=int(parts[8]),
-        paid=int(parts[9]),
-        won=int(parts[10]),
+        bankroll=bankroll,
+        paid=paid,
+        won=won,
         hole_cards=hole_cards,
     )
 
@@ -516,69 +546,105 @@ def parse_archive(
         "hands_converted": 0,
         "rows_emitted": 0,
         "hands_skipped": 0,
+        "malformed_hdb_lines": 0,
+        "malformed_pdb_lines": 0,
+        "corrupt_archives_skipped": 0,
     }
+    malformed_hdb_examples: List[str] = []
+    malformed_pdb_examples: List[str] = []
+    archive_error: Optional[str] = None
 
-    with tarfile.open(archive_path, "r:gz") as archive:
-        members = archive.getmembers()
-        hdb_member = next((member for member in members if member.name.endswith("/hdb")), None)
-        if hdb_member is None:
-            return [], stats
+    try:
+        with tarfile.open(archive_path, "r:gz") as archive:
+            members = archive.getmembers()
+            hdb_member = next((member for member in members if member.name.endswith("/hdb")), None)
+            if hdb_member is None:
+                return [], stats
 
-        hdb_records: Dict[int, HdbRecord] = {}
-        hdb_file = archive.extractfile(hdb_member)
-        if hdb_file is None:
-            return [], stats
+            hdb_records: Dict[int, HdbRecord] = {}
+            hdb_file = archive.extractfile(hdb_member)
+            if hdb_file is None:
+                return [], stats
 
-        for raw_line in hdb_file:
-            record = parse_hdb_line(raw_line.decode("utf-8", "ignore").strip())
-            if record is None or record.num_players != 2:
-                continue
-            hdb_records[record.timestamp] = record
-            if max_hands is not None and len(hdb_records) >= max_hands:
-                break
-
-        if not hdb_records:
-            return [], stats
-
-        target_timestamps = set(hdb_records)
-        pdb_grouped: DefaultDict[int, List[PlayerRecord]] = collections.defaultdict(list)
-        pdb_members = [member for member in members if "/pdb/pdb." in member.name]
-
-        for member in pdb_members:
-            pdb_file = archive.extractfile(member)
-            if pdb_file is None:
-                continue
-            for raw_line in pdb_file:
-                record = parse_pdb_line(raw_line.decode("utf-8", "ignore").strip())
-                if record is None or record.timestamp not in target_timestamps:
+            for raw_line in hdb_file:
+                line = raw_line.decode("utf-8", "ignore").strip()
+                record = parse_hdb_line(line)
+                if record is None:
+                    stats["malformed_hdb_lines"] += 1
+                    if len(malformed_hdb_examples) < 3:
+                        malformed_hdb_examples.append(line)
                     continue
-                pdb_grouped[record.timestamp].append(record)
+                if record.num_players != 2:
+                    continue
+                hdb_records[record.timestamp] = record
+                if max_hands is not None and len(hdb_records) >= max_hands:
+                    break
 
-        small_blind, big_blind = infer_blinds(pdb_grouped)
-        examples: List[Dict] = []
+            if not hdb_records:
+                return [], stats
 
-        for timestamp in sorted(target_timestamps):
-            stats["hands_seen"] += 1
-            player_records = pdb_grouped.get(timestamp, [])
-            if len(player_records) != 2:
-                stats["hands_skipped"] += 1
-                continue
+            target_timestamps = set(hdb_records)
+            pdb_grouped: DefaultDict[int, List[PlayerRecord]] = collections.defaultdict(list)
+            pdb_members = [member for member in members if "/pdb/pdb." in member.name]
 
-            unique_hand_id = archive_index * HAND_ID_ARCHIVE_MULTIPLIER + timestamp
-            hand_examples = convert_heads_up_hand(
-                hand_id=unique_hand_id,
-                hdb_record=hdb_records[timestamp],
-                player_records=player_records,
-                small_blind=small_blind,
-                big_blind=big_blind,
-            )
-            if not hand_examples:
-                stats["hands_skipped"] += 1
-                continue
+            for member in pdb_members:
+                pdb_file = archive.extractfile(member)
+                if pdb_file is None:
+                    continue
+                for raw_line in pdb_file:
+                    line = raw_line.decode("utf-8", "ignore").strip()
+                    record = parse_pdb_line(line)
+                    if record is None:
+                        stats["malformed_pdb_lines"] += 1
+                        if len(malformed_pdb_examples) < 3:
+                            malformed_pdb_examples.append(line)
+                        continue
+                    if record.timestamp not in target_timestamps:
+                        continue
+                    pdb_grouped[record.timestamp].append(record)
 
-            examples.extend(hand_examples)
-            stats["hands_converted"] += 1
-            stats["rows_emitted"] += len(hand_examples)
+            small_blind, big_blind = infer_blinds(pdb_grouped)
+            examples: List[Dict] = []
+
+            for timestamp in sorted(target_timestamps):
+                stats["hands_seen"] += 1
+                player_records = pdb_grouped.get(timestamp, [])
+                if len(player_records) != 2:
+                    stats["hands_skipped"] += 1
+                    continue
+
+                unique_hand_id = archive_index * HAND_ID_ARCHIVE_MULTIPLIER + timestamp
+                hand_examples = convert_heads_up_hand(
+                    hand_id=unique_hand_id,
+                    hdb_record=hdb_records[timestamp],
+                    player_records=player_records,
+                    small_blind=small_blind,
+                    big_blind=big_blind,
+                )
+                if not hand_examples:
+                    stats["hands_skipped"] += 1
+                    continue
+
+                examples.extend(hand_examples)
+                stats["hands_converted"] += 1
+                stats["rows_emitted"] += len(hand_examples)
+    except (EOFError, tarfile.TarError, OSError) as exc:
+        stats["corrupt_archives_skipped"] = 1
+        archive_error = f"{type(exc).__name__}: {exc}"
+        examples = []
+
+    if archive_error is not None:
+        print(f"  note: skipped corrupt archive: {archive_error}")
+        return examples, stats
+
+    if malformed_hdb_examples:
+        print(f"  note: skipped {stats['malformed_hdb_lines']} malformed hdb line(s)")
+        for example in malformed_hdb_examples:
+            print(f"    malformed hdb sample: {example}")
+    if malformed_pdb_examples:
+        print(f"  note: skipped {stats['malformed_pdb_lines']} malformed pdb line(s)")
+        for example in malformed_pdb_examples:
+            print(f"    malformed pdb sample: {example}")
 
     return examples, stats
 
@@ -678,7 +744,9 @@ def main() -> int:
             aggregate_stats.update(stats)
             print(
                 f"  heads-up hands seen={stats['hands_seen']}, converted={stats['hands_converted']}, "
-                f"skipped={stats['hands_skipped']}, rows={stats['rows_emitted']}"
+                f"skipped={stats['hands_skipped']}, malformed_hdb={stats['malformed_hdb_lines']}, "
+                f"malformed_pdb={stats['malformed_pdb_lines']}, "
+                f"corrupt_archive={stats['corrupt_archives_skipped']}, rows={stats['rows_emitted']}"
             )
 
         if args.indent is not None and not first:
@@ -692,6 +760,9 @@ def main() -> int:
     print(f"Hands seen: {aggregate_stats['hands_seen']}")
     print(f"Hands converted: {aggregate_stats['hands_converted']}")
     print(f"Hands skipped: {aggregate_stats['hands_skipped']}")
+    print(f"Malformed hdb lines skipped: {aggregate_stats['malformed_hdb_lines']}")
+    print(f"Malformed pdb lines skipped: {aggregate_stats['malformed_pdb_lines']}")
+    print(f"Corrupt archives skipped: {aggregate_stats['corrupt_archives_skipped']}")
     print(f"Rows written: {row_count}")
     print(f"Saved to: {output_path}")
 
